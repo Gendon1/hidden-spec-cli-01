@@ -130,12 +130,10 @@ function findOccurrences(
 }
 
 /** Tier 2 re-indentation of a new line (SPEC section 5). */
-function reindent(text: string, fileLines: string[], pos: number, O: string[], tier: number | undefined): string {
+function reindent(text: string, tier: number | undefined, P: string, F: string, prefix: boolean): string {
   if (tier !== 2) return text;
   if (text === '' || trimWs(text) === '') return text;
-  const P = leadingWs(O[0]);
-  const F = leadingWs(fileLines[pos]);
-  if (text.startsWith(P)) return F + text.slice(P.length);
+  if (prefix ? text.startsWith(P) : leadingWs(text) === P) return F + text.slice(P.length);
   return text;
 }
 
@@ -216,13 +214,12 @@ function parseUniSection(
     diffNew: string | null = null;
   let isCreate = false,
     isDelete = false;
-  const startPair = lines[start].startsWith('--- ') && (lines[start + 1] ?? '').startsWith('+++ ');
   for (;;) {
     if (i >= lines.length) break;
     const l = lines[i];
     if (l.startsWith('@@')) break;
     if (l.startsWith('diff --git') && i !== start) break;
-    if ((l.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')) && i !== start && startPair) break;
+    if ((l.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')) && i !== start && pair) break;
     if (l.startsWith('diff --git ')) {
       const m = l.match(/^diff --git a\/(.+) b\/(.+)$/);
       if (!m) throw new Exit2(`error: parse ${i + 1}`);
@@ -369,17 +366,19 @@ function makeUniEdit(sec: { o: string | null; n: string | null; isCreate: boolea
         k = K;
         tier = found.tier;
       } else {
-        pos = Math.min(h.A + d, lines.length);
+        pos = Math.max(0, Math.min(h.A + d, lines.length));
         k = 0;
       }
       const out: string[] = [];
       let j = 0;
+      const _P = O.length ? leadingWs(O[0]) : '';
+      const _F = O.length && pos < lines.length ? leadingWs(lines[pos]) : '';
       for (const e of h.body) {
         if (e.type === 'ctx') {
           out.push(lines[pos + j]);
           j++;
         } else if (e.type === 'old') j++;
-        else if (e.type === 'new') out.push(reindent(e.text, lines, pos, O, tier));
+        else if (e.type === 'new') out.push(reindent(e.text, tier, _P, _F, true));
       }
       if (pos + k === lines.length) {
         const last = h.body[h.body.length - 1];
@@ -435,7 +434,7 @@ function makeSREdit(path: string, oldLines: string[], newLines: string[], strict
     if (found.occs.length !== 1) throw new Fail('ambiguous', path);
     const pos = found.occs[0]!;
     const out: string[] = [];
-    for (const nl of newLines) out.push(reindent(nl, fl.lines, pos, oldLines, found.tier));
+    for (const nl of newLines) out.push(reindent(nl, found.tier, leadingWs(oldLines[0]), leadingWs(fl.lines[pos]), true));
     const lines = fl.lines.slice(0, pos).concat(out, fl.lines.slice(pos + oldLines.length));
     tree.now.set(path, writeLines(lines, fl.eol, fl.finalBreak));
   };
@@ -539,12 +538,32 @@ function makeV4aUpdate(p: string, np: string | null, chunks: Chunk[], strict: bo
       }
       const out: string[] = [];
       let j = 0;
+      let _P: string, _F: string;
+      if (ch.eof) {
+        let firstO: HunkBodyEntry | null = null;
+        for (const b of ch.body) {
+          if (b.type === 'ctx' || b.type === 'old') {
+            firstO = b;
+            break;
+          }
+        }
+        if (firstO) {
+          _P = leadingWs((firstO.type === 'ctx' ? ' ' : '-') + firstO.text);
+          _F = pos + k - 1 < lines.length ? leadingWs(lines[pos + k - 1]) : '';
+        } else {
+          _P = '';
+          _F = '';
+        }
+      } else {
+        _P = O.length ? leadingWs(O[0]) : '';
+        _F = O.length && pos < lines.length ? leadingWs(lines[pos]) : '';
+      }
       for (const e of ch.body) {
         if (e.type === 'ctx') {
           out.push(lines[pos + j]);
           j++;
         } else if (e.type === 'old') j++;
-        else out.push(ch.eof ? e.text : reindent(e.text, lines, pos, O, tier));
+        else out.push(reindent(e.text, tier, _P, _F, !ch.eof));
       }
       lines = lines.slice(0, pos).concat(out, lines.slice(pos + k));
       cursor = pos + out.length;
@@ -578,21 +597,25 @@ function v4aEdits(lines: string[], strict: boolean, moves: [string, string][]): 
       const p = l.slice(14).trim();
       i++;
       const ls: string[] = [];
+      let pending = 0;
       while (i < lastNB) {
         const c = lines[i];
         if (c.startsWith('+')) {
+          while (pending > 0) {
+            ls.push('');
+            pending--;
+          }
           ls.push(c.slice(1));
           i++;
           continue;
         }
         if (c === '') {
-          ls.push('');
+          pending++;
           i++;
           continue;
         }
         break;
       }
-      while (ls.length && ls[ls.length - 1] === '') ls.pop();
       edits.push((tree) => {
         if (!safe(p)) throw new Fail('unsafe', p);
         if (tree.get(p) !== null) throw new Fail('exists', p);
@@ -627,8 +650,7 @@ function v4aEdits(lines: string[], strict: boolean, moves: [string, string][]): 
       while (i < lastNB) {
         const c = lines[i];
         if (blank(c)) {
-          if (!cur) cur = { anchor: null, eof: false, body: [] };
-          cur.body.push({ type: 'ctx', text: '' });
+          if (cur && !cur.eof) cur.body.push({ type: 'ctx', text: '' });
           i++;
           continue;
         }
@@ -646,12 +668,14 @@ function v4aEdits(lines: string[], strict: boolean, moves: [string, string][]): 
             chunks.push(cur);
             cur = null;
           }
-          cur = { anchor: c.slice(2).trim(), eof: false, body: [] };
+          const anchor = c.slice(2).trim();
+          cur = { anchor: anchor === '' ? null : anchor, eof: false, body: [] };
           hadChunk = true;
           i++;
           continue;
         }
         if (c.startsWith(' ') || c.startsWith('-') || c.startsWith('+')) {
+          if (cur && cur.eof) throw new Exit2(`error: parse ${i + 1}`);
           if (!cur) cur = { anchor: null, eof: false, body: [] };
           const type = c.startsWith(' ') ? 'ctx' : c.startsWith('-') ? 'old' : 'new';
           cur.body.push({ type, text: c.slice(1) } as HunkBodyEntry);
